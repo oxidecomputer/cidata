@@ -1,0 +1,39 @@
+[package]
+name = "cidata"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+description = "cloud-init NoCloud FAT file system generator"
+repository = "https://github.com/oxidecomputer/cidata"
+license = "MPL-2.0"
+keywords = ["cloud-init", "nocloud", "fat", "filesystem"]
+categories = ["filesystem"]
+exclude = [".github", "rustfmt.toml"]
+
+[[bench]]
+name = "bench"
+harness = false
+
+[dependencies]
+bytemuck = { version = "1.24.0", features = ["derive", "min_const_generics"] }
+
+[dev-dependencies]
+atomicwrites = "0.4.4"
+fatfs = "0.3.6"
+flate2 = "1.1.5"
+gungraun = "0.17.0"
+proptest = { version = "1.9.0", default-features = false, features = ["std"] }
+tar = "0.4.44"
+tempfile = "3.24.0"
+test-strategy = "0.4.3"
+xshell = "0.2.7"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+
+[profile.bench]
+debug = true
+strip = false
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
