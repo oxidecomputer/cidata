@@ -26,6 +26,7 @@ proptest = { version = "1.9.0", default-features = false, features = ["std"] }
 tar = "0.4.44"
 tempfile = "3.24.0"
 test-strategy = "0.4.3"
+uuid = { version = "1.19.0", features = ["v4"] }
 xshell = "0.2.7"
 
 [lints.clippy]

@@ -2,11 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
+#![allow(clippy::explicit_deref_methods)]
+
 use std::fmt::Debug;
 use std::io::Cursor;
 use std::io::ErrorKind;
 use std::io::Read;
 use std::ops::Deref;
+use std::ops::Not;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -28,6 +31,7 @@ use proptest::test_runner::TestRunner;
 use tar::Header;
 use test_strategy::Arbitrary;
 use test_strategy::proptest;
+use uuid::Uuid;
 use xshell::Cmd;
 use xshell::Shell;
 use xshell::cmd;
@@ -169,39 +173,149 @@ fn os_check(input: TestInput) {
     }
 
     let cidata = input.as_cidata();
-    let volume = cidata.generate().unwrap();
+    let mut volume = cidata.generate().unwrap();
+    if cfg!(target_os = "windows") {
+        append_vhd_footer(&mut volume);
+    }
 
     let tempdir = tempfile::tempdir().unwrap();
     let src = tempdir.path().join("testfat.img");
     std::fs::write(&src, &volume).unwrap();
-    let mountpoint = tempdir.path().join("mountpoint");
-    std::fs::create_dir(&mountpoint).unwrap();
 
     let sh = Shell::new().unwrap();
-    let (mount, unmount) = if cfg!(target_os = "illumos") {
-        (
-            cmd!(sh, "pfexec mount -F pcfs {src} {mountpoint}"),
-            cmd!(sh, "pfexec umount {mountpoint}"),
+    let (mountpoint, unmount) = if cfg!(target_os = "windows") {
+        let drive_letter = cmd!(
+            sh,
+            "powershell -Command '$ErrorActionPreference = \"Stop\"; (\
+                Mount-DiskImage \
+                    -ImagePath \"'{src}'\" \
+                    -StorageType VHD \
+                    -Access ReadOnly \
+                    -PassThru \
+                | Get-Disk | Get-Partition\
+            ).DriveLetter'"
         )
-    } else if cfg!(target_os = "linux") {
-        let blkid = cmd!(sh, "blkid {src}").read().unwrap();
-        assert!(blkid.contains("TYPE=\"vfat\""));
-        cmd!(sh, "fsck.fat -n {src}").run().unwrap();
-        (
-            cmd!(sh, "sudo mount {src} {mountpoint}"),
-            cmd!(sh, "sudo umount {mountpoint}"),
-        )
-    } else if cfg!(target_os = "macos") {
-        (
-            cmd!(sh, "diskutil image attach -mountPoint {mountpoint} {src}"),
-            cmd!(sh, "diskutil eject {mountpoint}"),
-        )
+        .read()
+        .unwrap();
+        let mountpoint = PathBuf::from(format!("{drive_letter}:\\"));
+        let unmount =
+            cmd!(sh, "powershell -Command Dismount-DiskImage -ImagePath {src}");
+        (mountpoint, unmount)
     } else {
-        unimplemented!();
+        let mountpoint = tempdir.path().join("mountpoint");
+        std::fs::create_dir(&mountpoint).unwrap();
+
+        let (mount, unmount) = if cfg!(target_os = "illumos") {
+            (
+                cmd!(sh, "pfexec mount -F pcfs -o ro {src} {mountpoint}"),
+                cmd!(sh, "pfexec umount {mountpoint}"),
+            )
+        } else if cfg!(target_os = "linux") {
+            let blkid = cmd!(sh, "blkid {src}").read().unwrap();
+            assert!(blkid.contains("TYPE=\"vfat\""));
+            cmd!(sh, "fsck.fat -n {src}").run().unwrap();
+            (
+                cmd!(sh, "sudo mount -o ro {src} {mountpoint}"),
+                cmd!(sh, "sudo umount {mountpoint}"),
+            )
+        } else if cfg!(target_os = "macos") {
+            (
+                cmd!(
+                    sh,
+                    "diskutil image attach -readOnly -mountPoint {mountpoint} {src}"
+                ),
+                cmd!(sh, "diskutil eject {mountpoint}"),
+            )
+        } else {
+            unimplemented!();
+        };
+        mount.run().unwrap();
+        (mountpoint, unmount)
     };
-    mount.run().unwrap();
+
     let _unmount = DropCmd(unmount);
     check_file_system(&cidata, &MountedFileSystem(mountpoint));
+}
+
+// In order to mount a FAT image on Windows, we need to convert it to a VHD. The
+// easiest way to do this is to simply append a footer.
+// https://go.microsoft.com/fwlink/p/?linkid=137171
+fn append_vhd_footer(volume: &mut Vec<u8>) {
+    // spec: https://go.microsoft.com/fwlink/p/?linkid=137171
+
+    #[derive(Clone, Copy, bytemuck::AnyBitPattern, bytemuck::NoUninit)]
+    #[repr(C)]
+    struct VhdFooter {
+        cookie: [u8; 8],
+        features: [u8; 4],
+        file_format_version: [u8; 4],
+        data_offset: [u8; 8],
+        time_stamp: [u8; 4],
+        creator_application: [u8; 4],
+        creator_version: [u8; 4],
+        creator_host_os: [u8; 4],
+        original_size: [u8; 8],
+        current_size: [u8; 8],
+        cylinders: [u8; 2],
+        heads: u8,
+        sectors_per_track: u8,
+        disk_type: [u8; 4],
+        checksum: [u8; 4],
+        unique_id: [u8; 16],
+        saved_state: u8,
+        reserved: [u8; 427],
+    }
+
+    let total_sectors = volume.len() / 512;
+    // per the spec, sectors_per_track is always 17, 31, 63, or 255. given the
+    // file size limit of a FAT12 file system, the given calculation always
+    // results in 17 sectors per track.
+    let sectors_per_track = 17u8;
+    let cylinders_times_heads = total_sectors / usize::from(sectors_per_track);
+    let heads =
+        u8::try_from(cylinders_times_heads.div_ceil(1024)).unwrap().max(4);
+    assert!(heads <= 16);
+    let cylinders =
+        u16::try_from(cylinders_times_heads.div_ceil(usize::from(heads)))
+            .unwrap()
+            .max(1);
+    // pad the image so that the disk image is not truncated
+    let len = usize::from(cylinders)
+        * usize::from(heads)
+        * usize::from(sectors_per_track)
+        * 512;
+    assert!(len >= volume.len());
+    volume.resize(len, 0);
+    let size = u64::try_from(len).unwrap();
+
+    let mut footer = VhdFooter {
+        cookie: *b"conectix",
+        features: 0x0000_0002_u32.to_be_bytes(),
+        file_format_version: 0x0001_0000_u32.to_be_bytes(),
+        data_offset: u64::MAX.to_be_bytes(), // indicates fixed-size disk
+        time_stamp: 0u32.to_be_bytes(),
+        creator_application: *b"meow",
+        creator_version: 0x0001_0000u32.to_be_bytes(),
+        creator_host_os: *b"Wi2k",
+        original_size: size.to_be_bytes(),
+        current_size: size.to_be_bytes(),
+        cylinders: cylinders.to_be_bytes(),
+        heads,
+        sectors_per_track,
+        disk_type: 2u32.to_be_bytes(), // "Fixed hard disk"
+        checksum: 0u32.to_be_bytes(),
+        unique_id: Uuid::new_v4().into_bytes(),
+        saved_state: 0,
+        reserved: [0; 427],
+    };
+    let bytes = bytemuck::bytes_of_mut(&mut footer);
+    footer.checksum = bytes
+        .iter()
+        .copied()
+        .fold(0u32, |acc, b| acc.wrapping_add(b.into()))
+        .not()
+        .to_be_bytes();
+    volume.extend_from_slice(bytemuck::bytes_of(&footer));
 }
 
 #[test]
@@ -210,6 +324,7 @@ fn generate_test_archive() {
         ($size:expr) => {{
             let mut header = Header::new_gnu();
             header.set_size($size.try_into().unwrap());
+            header.set_mode(0o644);
             header
         }};
     }
@@ -217,7 +332,7 @@ fn generate_test_archive() {
     static COUNT: AtomicUsize = AtomicUsize::new(1);
 
     let config = Config {
-        test_name: Some("integration::generate_test_zip"),
+        test_name: Some("integration::generate_test_archive"),
         source_file: Some(file!()),
         ..proptest::test_runner::contextualize_config(Config::default())
     };
